@@ -743,6 +743,265 @@ struct RouterTests {
         }
     }
 
+    // Test a known path requested with an unsupported method returns 405 listing the
+    // methods the path does support
+    @Test func testMethodNotAllowed() async throws {
+        let router = Router(options: .methodNotAllowed)
+        router.get("test") { _, _ in "TestString" }
+        router.put("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .post) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "GET, PUT")
+            }
+        }
+    }
+
+    // Test method not allowed is off by default, ie a known path with an unsupported
+    // method still returns 404
+    @Test func testMethodNotAllowedIsOptIn() async throws {
+        let router = Router()
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .post) { response in
+                #expect(response.status == .notFound)
+                #expect(response.headers[.allow] == nil)
+            }
+        }
+    }
+
+    // Test an unresolved path still returns 404 when method not allowed is enabled
+    @Test func testMethodNotAllowedLeavesUnknownPathsAlone() async throws {
+        let router = Router(options: .methodNotAllowed)
+        router.get("test/this") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            // path that was never registered
+            try await client.execute(uri: "/not-a-route", method: .get) { response in
+                #expect(response.status == .notFound)
+                #expect(response.headers[.allow] == nil)
+            }
+            // path that is a prefix of a registered route, but has no routes of its own
+            try await client.execute(uri: "/test", method: .get) { response in
+                #expect(response.status == .notFound)
+                #expect(response.headers[.allow] == nil)
+            }
+        }
+    }
+
+    // Test Allow header includes auto generated HEAD endpoints
+    @Test func testMethodNotAllowedIncludesGeneratedHeadEndpoints() async throws {
+        let router = Router(options: [.methodNotAllowed, .autoGenerateHeadEndpoints])
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .delete) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "GET, HEAD")
+            }
+        }
+    }
+
+    // Test method not allowed works for routes matched via a path parameter
+    @Test func testMethodNotAllowedWithPathParameter() async throws {
+        let router = Router(options: .methodNotAllowed)
+        router.get("test/{id}") { _, context in try context.parameters.require("id") }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test/1", method: .post) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "GET")
+            }
+        }
+    }
+
+    // Test the method not allowed response is run through the router middleware chain
+    @Test func testMethodNotAllowedRunsMiddleware() async throws {
+        struct CountingMiddleware<Context: RequestContext>: RouterMiddleware {
+            let count: ManagedAtomic<Int>
+
+            func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
+                self.count.wrappingIncrement(ordering: .relaxed)
+                return try await next(request, context)
+            }
+        }
+
+        let count = ManagedAtomic(0)
+        let router = Router(options: .methodNotAllowed)
+        router.middlewares.add(CountingMiddleware(count: count))
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .post) { response in
+                #expect(response.status == .methodNotAllowed)
+            }
+        }
+        #expect(count.load(ordering: .relaxed) == 1)
+    }
+
+    // Test endpointPath is set for method not allowed responses, so metrics and tracing
+    // can report them separately
+    @Test func testMethodNotAllowedEndpointPath() async throws {
+        struct TestEndpointMiddleware<Context: RequestContext>: RouterMiddleware {
+            func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
+                do {
+                    return try await next(request, context)
+                } catch {
+                    return .init(status: .ok, body: .init(byteBuffer: ByteBuffer(string: context.endpointPath ?? "")))
+                }
+            }
+        }
+
+        let router = Router(options: .methodNotAllowed)
+        router.middlewares.add(TestEndpointMiddleware())
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .post) { response in
+                #expect(String(buffer: response.body) == "MethodNotAllowed")
+            }
+        }
+    }
+
+    // Test Allow lists the methods of the node the router actually resolved to, and not the
+    // union of every route whose path pattern matches. A literal path component has a higher
+    // priority than a capture, so the capture route's methods are not reachable at this path
+    // and must not be advertised
+    @Test func testMethodNotAllowedUsesResolvedRouteNotMatchingRoutes() async throws {
+        let router = Router(options: .methodNotAllowed)
+        router.post("query/aql/explain") { _, _ in "explain" }
+        router.get("query/aql/{name}") { _, _ in "get query" }
+        router.post("query/aql/{name}") { _, _ in "store query" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            // the capture route supports GET, but the router resolves "explain" to the
+            // literal route, which does not
+            try await client.execute(uri: "/query/aql/explain", method: .get) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "POST")
+            }
+            // a path that does resolve to the capture route advertises both its methods
+            try await client.execute(uri: "/query/aql/some_query", method: .delete) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "GET, POST")
+            }
+        }
+    }
+
+    // Test auto generation of OPTIONS endpoints works
+    @Test func testAutoGenerateOptionsEndpoints() async throws {
+        let router = Router(options: .autoGenerateOptionsEndpoints)
+        router.get("test") { _, _ in "TestString" }
+        router.post("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .options) { response in
+                #expect(response.status == .noContent)
+                // the generated endpoint supports OPTIONS itself, so it is listed too
+                #expect(response.headers[.allow] == "GET, OPTIONS, POST")
+            }
+        }
+    }
+
+    // Test auto generated OPTIONS endpoints are off by default
+    @Test func testAutoGenerateOptionsEndpointsIsOptIn() async throws {
+        let router = Router()
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .options) { response in
+                #expect(response.status == .notFound)
+            }
+        }
+    }
+
+    // Test an OPTIONS endpoint added to the router is not replaced by a generated one
+    @Test func testAutoGenerateOptionsEndpointsDoesNotOverrideRoute() async throws {
+        let router = Router(options: .autoGenerateOptionsEndpoints)
+        router.get("test") { _, _ in "TestString" }
+        router.on("test", method: .options) { _, _ in
+            Response(status: .ok, headers: [.allow: "custom"])
+        }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .options) { response in
+                #expect(response.status == .ok)
+                #expect(response.headers[.allow] == "custom")
+            }
+        }
+    }
+
+    // Test OPTIONS is only generated for paths that have routes
+    @Test func testAutoGenerateOptionsEndpointsLeavesUnknownPathsAlone() async throws {
+        let router = Router(options: .autoGenerateOptionsEndpoints)
+        router.get("test/this") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/not-a-route", method: .options) { response in
+                #expect(response.status == .notFound)
+            }
+            try await client.execute(uri: "/test", method: .options) { response in
+                #expect(response.status == .notFound)
+            }
+        }
+    }
+
+    // Test generated OPTIONS endpoints list auto generated HEAD endpoints
+    @Test func testAutoGenerateOptionsEndpointsIncludesGeneratedHeadEndpoints() async throws {
+        let router = Router(options: [.autoGenerateOptionsEndpoints, .autoGenerateHeadEndpoints])
+        router.get("test") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test", method: .options) { response in
+                #expect(response.status == .noContent)
+                #expect(response.headers[.allow] == "GET, HEAD, OPTIONS")
+            }
+        }
+    }
+
+    // Test generated OPTIONS endpoints are reported against their route path, so metrics
+    // and tracing attribute them to the endpoint rather than to NotFound
+    @Test func testAutoGenerateOptionsEndpointsEndpointPath() async throws {
+        struct TestEndpointMiddleware<Context: RequestContext>: RouterMiddleware {
+            func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
+                var response = try await next(request, context)
+                response.headers[.test] = context.endpointPath ?? ""
+                return response
+            }
+        }
+
+        let router = Router(options: .autoGenerateOptionsEndpoints)
+        router.middlewares.add(TestEndpointMiddleware())
+        router.get("test/{id}") { _, _ in "TestString" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/test/1", method: .options) { response in
+                #expect(response.headers[.test] == "/test/{id}")
+            }
+        }
+    }
+
+    // Test a generated OPTIONS endpoint is listed in the Allow header of a 405 response
+    @Test func testMethodNotAllowedIncludesGeneratedOptionsEndpoints() async throws {
+        let router = Router(options: [.methodNotAllowed, .autoGenerateOptionsEndpoints])
+        router.post("query/aql/explain") { _, _ in "explain" }
+        router.get("query/aql/{name}") { _, _ in "get query" }
+        router.post("query/aql/{name}") { _, _ in "store query" }
+        let app = Application(responder: router.buildResponder())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/query/aql/explain", method: .get) { response in
+                #expect(response.status == .methodNotAllowed)
+                #expect(response.headers[.allow] == "OPTIONS, POST")
+            }
+            try await client.execute(uri: "/query/aql/explain", method: .options) { response in
+                #expect(response.status == .noContent)
+                #expect(response.headers[.allow] == "OPTIONS, POST")
+            }
+        }
+    }
+
     @Test func testRouterPathStringInterpolation() async throws {
         let route = "/test"
         let router = Router()

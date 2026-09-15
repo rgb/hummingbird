@@ -63,6 +63,26 @@ public final class Router<Context: RequestContext>: RouterMethods, HTTPResponder
                 node.value?.autoGenerateHeadEndpoint()
             }
         }
+        if self.options.contains(.autoGenerateOptionsEndpoints) {
+            // this has to run after the HEAD endpoints have been generated, otherwise they
+            // will be missing from the `Allow` header
+            // swift-format-ignore: ReplaceForEachWithForLoop
+            self.trie.forEach { node in
+                node.value?.autoGenerateOptionsEndpoint { allow in
+                    self.middlewares.constructResponder(finalResponder: OptionsResponder<Context>(allow: allow))
+                }
+            }
+        }
+        if self.options.contains(.methodNotAllowed) {
+            // this has to run after the HEAD and OPTIONS endpoints have been generated,
+            // otherwise they will be missing from the `Allow` header
+            // swift-format-ignore: ReplaceForEachWithForLoop
+            self.trie.forEach { node in
+                node.value?.setMethodNotAllowedResponder { allow in
+                    self.middlewares.constructResponder(finalResponder: MethodNotAllowedResponder<Context>(allow: allow))
+                }
+            }
+        }
         return .init(
             context: Context.self,
             trie: self.trie,
@@ -110,6 +130,31 @@ struct NotFoundResponder<Context: RequestContext>: HTTPResponder {
     }
 }
 
+/// Responder that returns a method not allowed error, along with the list of methods the
+/// endpoint does support
+struct MethodNotAllowedResponder<Context: RequestContext>: HTTPResponder {
+    /// Value for the `Allow` header, required in a 405 response by RFC 9110 § 15.5.6
+    let allow: String
+
+    func respond(to request: Request, context: Context) throws -> Response {
+        context.coreContext.endpointPath.value = "MethodNotAllowed"
+        throw HTTPError(.methodNotAllowed, headers: [.allow: self.allow])
+    }
+}
+
+/// Responder that returns the methods an endpoint supports, for an OPTIONS request
+///
+/// RFC 9110 § 9.3.7 defines the response to OPTIONS as communicating the options available
+/// for a resource. As there is no response content, this returns 204 (No Content)
+struct OptionsResponder<Context: RequestContext>: HTTPResponder {
+    /// Value for the `Allow` header, listing the methods this endpoint supports
+    let allow: String
+
+    func respond(to request: Request, context: Context) -> Response {
+        Response(status: .noContent, headers: [.allow: self.allow])
+    }
+}
+
 /// A type that has a single method to build a HTTPResponder
 public protocol HTTPResponderBuilder {
     associatedtype Responder: HTTPResponder
@@ -129,4 +174,10 @@ public struct RouterOptions: OptionSet, Sendable {
     public static var caseInsensitive: Self { .init(rawValue: 1 << 0) }
     /// For every GET request that does not have a HEAD request, auto generate the HEAD request
     public static var autoGenerateHeadEndpoints: Self { .init(rawValue: 1 << 1) }
+    /// For every endpoint that does not have an OPTIONS request, auto generate one returning
+    /// the methods that endpoint supports in the `Allow` header
+    public static var autoGenerateOptionsEndpoints: Self { .init(rawValue: 1 << 2) }
+    /// Respond to a request whose path matches a route but whose method does not with
+    /// 405 (Method Not Allowed) instead of 404 (Not Found)
+    public static var methodNotAllowed: Self { .init(rawValue: 1 << 3) }
 }
