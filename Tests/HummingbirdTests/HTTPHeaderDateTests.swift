@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+import Atomics
 import Foundation
 import HummingbirdTesting
 import Testing
@@ -44,6 +45,37 @@ extension HTTPTests {
                 try await Task.sleep(nanoseconds: 1_500_000_000)
                 try await client.execute(uri: "/date", method: .get) { response in
                     #expect(response.headers[.date] != date)
+                }
+            }
+        }
+
+        @Test func testDateCacheFollowsSecondBoundary() {
+            let milliseconds = ManagedAtomic<Int64>(1_600_000_000_999)
+            let dateCache = DateCache { Date(timeIntervalSince1970: Double(milliseconds.load(ordering: .relaxed)) / 1000) }
+            #expect(dateCache.date == Date(timeIntervalSince1970: 1_600_000_000).httpHeader)
+            milliseconds.store(1_600_000_001_001, ordering: .relaxed)
+            #expect(dateCache.date == Date(timeIntervalSince1970: 1_600_000_001).httpHeader)
+            milliseconds.store(1_600_000_001_998, ordering: .relaxed)
+            #expect(dateCache.date == Date(timeIntervalSince1970: 1_600_000_001).httpHeader)
+        }
+
+        /// The date header names the second in which the response was generated (RFC9110 §6.6.1)
+        @Test func testDateHeaderIsCurrent() async throws {
+            let router = Router()
+            router.get("date") { _, _ in
+                "hello"
+            }
+            let app = Application(responder: router.buildResponder())
+
+            try await app.test(.live) { client in
+                for _ in 0..<30 {
+                    let sent = Date.now.timeIntervalSince1970.rounded(.down)
+                    let date = try await client.execute(uri: "/date", method: .get) { response in
+                        try #require(response.headers[.date].flatMap { Date(httpHeader: $0) })
+                    }
+                    let received = Date.now.timeIntervalSince1970.rounded(.down)
+                    #expect((sent...received).contains(date.timeIntervalSince1970))
+                    try await Task.sleep(for: .milliseconds(97))
                 }
             }
         }

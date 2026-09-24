@@ -149,7 +149,7 @@ extension ApplicationProtocol {
                 try await process()
             }
         }
-        let services: [any Service] = self.services + [dateCache, serverService]
+        let services: [any Service] = self.services + [serverService]
         let serviceGroup = ServiceGroup(
             configuration: .init(services: services, logger: self.logger)
         )
